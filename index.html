@@ -1431,6 +1431,7 @@ root.CFStrategy={install,chooseSourcePlan,registrationLine,SOURCE_RULES,SOURCE_P
 (function(root){'use strict';
 const continuations=new WeakMap();
 function register(fn,steps){continuations.set(fn,steps);}
+function hydrator(addon,steps){register(addon.hydrate,steps);return addon;}
 function* call(fn,receiver,args){
  yield {stage:'import'};
  const steps=continuations.get(fn);let value;
@@ -1502,7 +1503,7 @@ function* context(api,data,steps){
  do{q=api.validation(data,()=>g.next());if(!q.done)yield q.value;}while(!q.done);
  return q.value;
 }
-root.CFTutorialSlices=Object.freeze({register,call,context,loan,step,command});
+root.CFTutorialSlices=Object.freeze({register,call,context,loan,step,command,rebuild,hydrator});
 })(globalThis);
 
 /* Castle Fight reconstruction v0.5.0. Original implementation; never executes
@@ -5669,7 +5670,34 @@ async function digestAsync(value){
  if(nodeCrypto)return nodeCrypto.createHash('sha256').update(encoded,'utf8').digest('hex');
  throw new Error('Identity digest requires WebCrypto SHA-256');
 }
-const api=Object.freeze({encode,digest,digestAsync});root.CFSourceProductionIdentity=api;
+// Share only immutable, JSON-normalized unit definitions. Save/state clones stay unchanged.
+const immutableUnits=new WeakSet(),contentCopies=new WeakSet();
+function shareable(value,active=new WeakSet()){
+ if(value===null||typeof value==='string'||typeof value==='boolean')return true;
+ if(typeof value==='number')return Number.isFinite(value)&&!Object.is(value,-0);
+ if(typeof value!=='object'||!Object.isFrozen(value)||active.has(value))return false;
+ if(immutableUnits.has(value))return true;
+ const array=Array.isArray(value);
+ if(Object.getPrototypeOf(value)!==(array?Array.prototype:Object.prototype))return false;
+ const keys=Reflect.ownKeys(value);
+ if(array&&(keys.length!==value.length+1||keys.some(k=>k!=='length'&&(typeof k!=='string'||!/^(0|[1-9][0-9]*)$/.test(k)||Number(k)>=value.length))))return false;
+ active.add(value);
+ for(const key of keys){
+  if(array&&key==='length')continue;
+  const d=Object.getOwnPropertyDescriptor(value,key);
+  if(typeof key!=='string'||key==='toJSON'||!d.enumerable||!Object.hasOwn(d,'value')||!shareable(d.value,active)){active.delete(value);return false;}
+ }
+ active.delete(value);immutableUnits.add(value);return true;
+}
+function cloneContent(data){
+ const plain=data&&typeof data==='object'&&Object.getPrototypeOf(data)===Object.prototype;
+ const field=plain&&Object.getOwnPropertyDescriptor(data,'units');
+ if(!plain||(!Object.isFrozen(data)&&!contentCopies.has(data))||!field||!Object.hasOwn(field,'value')||
+    Reflect.ownKeys(data).some(k=>typeof k!=='string'||k==='toJSON'||!Object.getOwnPropertyDescriptor(data,k).enumerable||!Object.hasOwn(Object.getOwnPropertyDescriptor(data,k),'value'))||!shareable(field.value))return JSON.parse(JSON.stringify(data));
+ const copy=JSON.parse(JSON.stringify({...data,units:null}));
+ copy.units=field.value;contentCopies.add(copy);return copy;
+}
+const api=Object.freeze({encode,digest,digestAsync,cloneContent});root.CFSourceProductionIdentity=api;
 if(typeof module==='object'&&module.exports)module.exports=api;
 })(typeof globalThis==='undefined'?this:globalThis);
 
@@ -6678,7 +6706,11 @@ function validate(data,q){
    if((h.phase.placementTicks||0)>(p.placementTicks||0)||(complete||h.phase.frozenTicks===p.frozenTicks)&&Object.keys(h.phase).some(k=>k!=='placementTicks'&&h.phase[k]!==p[k]))throw Error('Inconsistent retained production history');
   }else if(!h.phase&&h.type===e.type){
    const observed=e.state==='upgrading'?h.remaining:h.deadline;
-   if(observed!==null&&observed+(p.placementTicks||0)!==(e.state==='upgrading'?remaining:next))throw Error('Inconsistent retained production phase');
+   // A retained spawn already includes every earlier placement delay.
+   // Only a still-blocked spawn can add unobserved retries, one tick at a
+   // time; an upgrade preserves that exact next-tick remainder.
+   const retry=observed===null?0:Math.max(0,(e.state==='upgrading'?1:now+1)-observed);
+   if(observed!==null&&(retry>(p.placementTicks||0)||observed+retry!==(e.state==='upgrading'?remaining:next)))throw Error('Inconsistent retained production phase');
   }
  }
 }
@@ -7280,6 +7312,8 @@ function create(core){
   for(const a of addons.values())a.validateSave(q,legacy,d,source);
  }
  function hydrateAddons(s,q){for(const a of addons.values())a.hydrate(s,q);return s;}
+CFTutorialSlices.register(hydrateAddons,function*(s,q){for(const a of addons.values())(yield* CFTutorialSlices.call(a.hydrate,a,[s,q]));return s;});
+
  function appendAddons(s,q){const fields=captureAddons(s,true);for(const key of Object.keys(fields)){if(Object.hasOwn(q,key))throw Error('V24 addon shadows core state');q[key]=fields[key];}return q;}
  registerAddon({key:'modes',initialize(){},capture:s=>modes.forSave(s),validateSave(q,legacy){if(!Object.hasOwn(q,'modes')&&q.state?.options?.localInvestment===true)throw Error('Missing local investment mode envelope');if(!legacy&&!Object.hasOwn(q,'modes'))modes.fromOptions(q.state?.options,true);rounds.saveInput(q,modes,legacy);},hydrate(s,q){s.options.localInvestment=modes.fromOptions(q.state.options,true).localInvestment;}});
  registerAddon({key:'firstBuildBonus',initialize:s=>p43a.bind(s,{version:1,awarded:[],nextGold:20}),capture:p43a.snapshot,
@@ -7292,7 +7326,7 @@ function create(core){
    if(legacy&&!row?.stateDomains?.includes('roundFlow')&&(Object.hasOwn(q,'roundFlow')||rounds.specs.some(s=>Object.hasOwn(q.state?.options||{},s.key)||Object.hasOwn(q.modes||{},s.key))))throw Error('Historical save contains future round state');
    const z=rounds.saveInput(q,modes,legacy);rounds.validate(d,q,modes.fromOptions(z.state.options,true));
   },hydrate(s,q){const d=publicData(s);rounds.restore(s,d,q,rounds.validate(d,q,modes.fromOptions(q.state.options,true)));}});
- function inverse(data){const input=root.CFUltimateMode?root.CFUltimateMode.inverse(data):data,d=root.CFV24Addons?root.CFV24Addons.inverse(input):clone(input);for(const[id,old]of Object.entries(d.upgradeGraph?.previousUpgrades||{}))d.buildings.find(b=>b.id===id).upgrades=old;for(const[race,old]of Object.entries(d.upgradeGraph?.previousReachable||{}))d.races.find(r=>r.race===race).reachable_buildings=old;delete d.upgradeGraph;d.release=d.releaseV24.previousRelease;delete d.releaseV24;delete d.elementalFamily;d.version='0.23.0';d.contentHash=core.HASH;return d;}
+ function inverse(data){const input=root.CFUltimateMode?root.CFUltimateMode.inverse(data):data,d=root.CFV24Addons?root.CFV24Addons.inverse(input):(typeof module==='object'&&module.exports?require('./source-production-identity'):root.CFSourceProductionIdentity).cloneContent(input);for(const[id,old]of Object.entries(d.upgradeGraph?.previousUpgrades||{}))d.buildings.find(b=>b.id===id).upgrades=old;for(const[race,old]of Object.entries(d.upgradeGraph?.previousReachable||{}))d.races.find(r=>r.race===race).reachable_buildings=old;delete d.upgradeGraph;d.release=d.releaseV24.previousRelease;delete d.releaseV24;delete d.elementalFamily;d.version='0.23.0';d.contentHash=core.HASH;return d;}
  function header(d){if(d?.version!=='0.24.0'||d.release?.schema!==24||d.contentHash!==contract.contentHash)throw Error('Unreviewed V24 content');}
  function freeze(x,seen=new WeakSet()){if(x&&typeof x==='object'&&!seen.has(x)){seen.add(x);for(const v of Object.values(x))freeze(v,seen);if(!Object.isFrozen(x))Object.freeze(x);}return x;}
  function admitDataSync(d){if(admitted.has(d))return d;if(identity.digest(d)!==contract.fingerprint)throw Error('Unreviewed complete V24 fingerprint');header(d);const p=inverse(d);core.admitDataSync(p);freeze(d);root.CFUltimateMode?.admit(d);admitted.set(d,p);return d;}
@@ -7371,14 +7405,14 @@ CFTutorialSlices.register(Simulation.importSave,function*(d,q){
    const sourceData=row.h06oVersion===1?d:row.upgradeGraphVersion?(root.CFH06O?root.CFH06O.inverse(d):d):prior(d);
    if(row.schema===24)validateUpgradeWork(sourceData,q);
    if(row.productionPhaseVersion===1)phase.validate(sourceData,q);else phase.migrate(s,q,d,{placementRetries:row.placementRetryVersion===1});
-   hydrateAddons(s,q);
+   (yield* CFTutorialSlices.call(hydrateAddons,null,[s,q]));
    const migrated=root.CFV24Addons.migrate(d,q,row,()=>s.snapshot(),s);return root.CFSummons?(yield* CFTutorialSlices.call(root.CFSummons.importLegacyNature,root.CFSummons,[d,migrated,function*(data,save){return (yield* CFTutorialSlices.call(this.restore,this,[data,save]));}.bind(this)])):(yield* CFTutorialSlices.call(this.restore,this,[d,migrated]));
   });
 
 CFTutorialSlices.register(Simulation.restore,function*(d,q){
    prior(d);identity.encode(q);if(q?.schema!==24||q.contentHash!==d.contentHash)throw Error('Incompatible V24 save');validateBaseArrays(q);addonsSealed=true;validateUpgradeWork(d,q);phase.validate(d,q);validateAddons(q,false,d);
    const restore=function*(){return (yield* CFTutorialSlices.call(Base.restore,Base,[prior(d),peel(q)]));};
-   return rounds.validateSelectionStart(hydrateAddons(bind(root.CFV24Addons?(yield* CFTutorialSlices.context(root.CFV24Addons,d,restore)):(yield* restore()),d),q),d,Simulation);
+   return rounds.validateSelectionStart((yield* CFTutorialSlices.call(hydrateAddons,null,[bind(root.CFV24Addons?(yield* CFTutorialSlices.context(root.CFV24Addons,d,restore)):(yield* restore()),d),q])),d,Simulation);
   });
 
  // Callback wrappers retain the existing combat step; flow runs outside them
@@ -7406,7 +7440,7 @@ CFTutorialSlices.register(Simulation.restore,function*(d,q){
  function stepForUI(s){if(rounds.isFlow(s))return s.step()||s;const d=publicData(s),before=captureAddons(s),next=validationContext(d,()=>core.stepForUI(s));return next===s?s:recoverUI(next,d,before);}
  function commandForUI(s,side,cmd){const d=publicData(s),before=captureAddons(s),out=validationContext(d,()=>core.commandForUI(s,side,cmd));return out.sim===s?out:{...out,sim:recoverUI(out.sim,d,before)};}
  const importSave=Simulation.importSave;
- return {...core,adoptValidatedTransfer(s,q){core.adoptValidatedProfiles(s,q);return hydrateAddons(s,q);},Simulation,create,registerAddon,installFlowRuntime,validateCompleteState:s=>rounds.validateSelectionStart(s,publicData(s),Simulation),importSave,currentData:s=>dataFor.get(s),checkSave:q=>{const encoded=identity.encode(q);validateBaseArrays(q);return encoded;},admitData,admitDataSync,prior,publicData,stepForUI,commandForUI,SCHEMA:24,HASH:contract.contentHash,refusalNotice:core.refusalNotice};
+ return {...core,adoptValidatedTransfer(s,q){core.adoptValidatedProfiles(s,q);return hydrateAddons(s,q);},*adoptValidatedTransferSteps(s,q){core.adoptValidatedProfiles(s,q);yield* root.CFTutorialSlices.call(hydrateAddons,null,[s,q]);},Simulation,create,registerAddon,installFlowRuntime,validateCompleteState:s=>rounds.validateSelectionStart(s,publicData(s),Simulation),importSave,currentData:s=>dataFor.get(s),checkSave:q=>{const encoded=identity.encode(q);validateBaseArrays(q);return encoded;},admitData,admitDataSync,prior,publicData,stepForUI,commandForUI,SCHEMA:24,HASH:contract.contentHash,refusalNotice:core.refusalNotice};
 }
 const api=node?create(require('./demolish')):{create};
 if(node){require('./elemental-family').install(api.Simulation);require('./ancl-markers').install(api.Simulation,{evidence:require('../data/ancl_markers_evidence.json')});}
@@ -10124,7 +10158,7 @@ CFTutorialSlices.register(Simulation.restore,function*(data,q){
   validate(data,q);const s=(yield* CFTutorialSlices.call(restore,this,[data,q]));s.destructiblesState=copy(q.destructibles||empty());attach(s);
   // A retained clean navigation cache was built before this domain hydrated.
   // Re-derive the overlay while preserving the saved logical cache revision.
-  if(s.destructiblesState.objects.length&&!s.nav.dirty){const revision=s.nav.revision;s.nav.dirty=true;s.nav.rebuild(s.navigationBuildings(),s.gates);s.nav.revision=revision;delete s.nav.spawnPlacementRevision;delete s.nav.spawnPlacements;}
+  if(s.destructiblesState.objects.length&&!s.nav.dirty){const revision=s.nav.revision;s.nav.dirty=true;(yield* CFTutorialSlices.rebuild(s.nav,s.navigationBuildings(),s.gates,s.nav.interactiveCells?.()||[]));s.nav.revision=revision;delete s.nav.spawnPlacementRevision;delete s.nav.spawnPlacements;}
   return s;
  });
 
@@ -11081,7 +11115,7 @@ const total=(rows,side)=>Number(rows.reduce((n,c)=>n+BigInt(c.counts[side]),0n))
 function fresh(ultimate=false){return {version:1,profile:'source-events',presence:history.sourceHistory(),producers:Array.from({length:ultimate?79:5},()=>history.sourceHistory()),attachments:[]};}
 function legacy(){return {version:1,profile:'legacy-untracked',attachments:[]};}
 function previousContent(data){
- const d=clone(data),c=d.linker;delete d.linker;
+ const d=(typeof module==='object'&&module.exports?require('./source-production-identity'):root.CFSourceProductionIdentity).cloneContent(data),c=d.linker;delete d.linker;
  Object.assign(d.buildings.find(b=>b.id==='h063'),c.previousBuilding);
  d.releaseV24.acceptedPriorHashes=c.previousPriorHashes;d.release.legacySaves=c.previousLegacySaves;d.contentHash=c.baseContentHash;return d;
 }
@@ -11509,7 +11543,7 @@ const clone=x=>JSON.parse(JSON.stringify(x)),alive=e=>!!e&&!e.dead&&e.hp>.405,ti
 const freshV2=()=>({version:2,jobs:[],roots:[],anchors:[],legacyCasts:[]});
 const states=new WeakMap(),observers=new WeakMap(),fresh=()=>({...freshV2(),version:3,lastSequence:0,retiredThrough:0,retired:[]});
 const state=s=>{if(!states.has(s))states.set(s,fresh());return states.get(s);};
-function previousContent(data){const d=clone(data),c=d.peyote;delete d.peyote;Object.assign(d.buildings.find(b=>b.id==='h06I'),c.previousBuilding);for(const[id,v]of Object.entries(c.previousAbilities))Object.assign(d.abilities[id],v);d.contentHash=c.baseContentHash;return d;}
+function previousContent(data){const d=(typeof module==='object'&&module.exports?require('./source-production-identity'):root.CFSourceProductionIdentity).cloneContent(data),c=d.peyote;delete d.peyote;Object.assign(d.buildings.find(b=>b.id==='h06I'),c.previousBuilding);for(const[id,v]of Object.entries(c.previousAbilities))Object.assign(d.abilities[id],v);d.contentHash=c.baseContentHash;return d;}
 const rootTicks=(d,type)=>ticks(d.units[type].classes.includes('hero')||d.passiveDefense&&d.units[type].abilities.includes('A07B')?d.abilities.A0HY.fields.HeroDur1:d.abilities.A0HY.fields.Dur1);
 function validateBasic(q,d,currentDuration=false){
  const o=Object.hasOwn(q,'peyote')?q.peyote:fresh(),st=q.state,fail=()=>{throw Error('Invalid Peyote callback save');};
@@ -11747,7 +11781,7 @@ const fresh=()=>({version:1,trees:[],activation:null,nextRefill:null,refills:0,p
 const state=s=>{if(!states.has(s))states.set(s,fresh());return states.get(s);};
 const birth=r=>[r.job,r.attempt,r.slot,r.tree,r.poolBorn,r.releaseTick].join(':');
 const allSaved=q=>['units','corpses','buildings','castles','gates','builders'].flatMap(k=>q.state[k]||[]);
-function previousContent(data){const d=clone(data),c=d.ancientTree;delete d.ancientTree;Object.assign(d.buildings.find(b=>b.id==='h02D'),c.previousBuilding);for(const[id,v]of Object.entries(c.previousAbilities))Object.assign(d.abilities[id],v);d.summons=c.previousSummons;d.contentHash=c.baseContentHash;return d;}
+function previousContent(data){const d=(typeof module==='object'&&module.exports?require('./source-production-identity'):root.CFSourceProductionIdentity).cloneContent(data),c=d.ancientTree;delete d.ancientTree;Object.assign(d.buildings.find(b=>b.id==='h02D'),c.previousBuilding);for(const[id,v]of Object.entries(c.previousAbilities))Object.assign(d.abilities[id],v);d.summons=c.previousSummons;d.contentHash=c.baseContentHash;return d;}
 function validate(q,d){
  const present=own(q,'ancientTree'),o=present?q.ancientTree:fresh(),st=q.state,c=d.ancientTree;
  const fail=()=>{throw Error('Inconsistent Ancient Tree save');},id=n=>uint(n)&&n>0&&n<st.id;
@@ -12192,9 +12226,9 @@ function install(Simulation,{evidence:r,registerAddon}={}){
   if(originals.size!==origins.size||generations.size!==v.serial)fail();
  }
  const pristine=v=>v.serial===0&&v.theme===null&&v.objects.every(o=>o.generation===0&&o.hp===o.maxHP&&!o.dead&&!o.removed&&o.due===null);
- registerAddon({key:'destructibleRegrowth',initialize:s=>{states.set(s,fresh());attach(s);load(s);},capture:s=>{const v=state(s);return v.objects.length&&!pristine(v)?v:undefined;},
+ registerAddon(CFTutorialSlices.hydrator({key:'destructibleRegrowth',initialize:s=>{states.set(s,fresh());attach(s);load(s);},capture:s=>{const v=state(s);return v.objects.length&&!pristine(v)?v:undefined;},
   validateSave(q,legacy,d,row){if(legacy&&q.destructibleRegrowth!==undefined&&!row?.stateDomains?.includes('destructibleRegrowth'))throw Error('Future regrowth state in prior save');validate(q);},
-  hydrate(s,q){const clean=!s.nav.dirty,rev=s.nav.revision;states.set(s,copy(q.destructibleRegrowth||fresh()));attach(s);load(s);if(state(s).objects.length&&clean){s.nav.dirty=true;s.nav.rebuild(s.navigationBuildings(),s.gates);s.nav.revision=rev;delete s.nav.spawnPlacements;delete s.nav.spawnPlacementRevision;}}});
+  hydrate(s,q){const clean=!s.nav.dirty,rev=s.nav.revision;states.set(s,copy(q.destructibleRegrowth||fresh()));attach(s);load(s);if(state(s).objects.length&&clean){s.nav.dirty=true;s.nav.rebuild(s.navigationBuildings(),s.gates);s.nav.revision=rev;delete s.nav.spawnPlacements;delete s.nav.spawnPlacementRevision;}}},function*(s,q){const clean=!s.nav.dirty,rev=s.nav.revision;states.set(s,copy(q.destructibleRegrowth||fresh()));attach(s);load(s);if(state(s).objects.length&&clean){s.nav.dirty=true;(yield* CFTutorialSlices.rebuild(s.nav,s.navigationBuildings(),s.gates,s.nav.interactiveCells?.()||[]));s.nav.revision=rev;delete s.nav.spawnPlacements;delete s.nav.spawnPlacementRevision;}}));
  P.sceneDestructibleState=function(){return copy(state(this));};
  P.sourceSceneObjects=function(){if(!available())return [];return copy(load(this).objects.filter(o=>!o.removed));};
  const destructible=P.destructible;P.destructible=function(id){if(typeof id==='string'&&id.startsWith('scene:'))return load(this).objects.find(o=>o.id===id&&!o.removed);return destructible.call(this,id);};
@@ -12240,7 +12274,7 @@ function install(Simulation,{evidence:r,registerAddon}={}){
  }}
  const step=P.step;P.step=function(...args){if(this.paused||this.winner!==null)return;const before=this.tick,out=step.apply(this,args);if(this.tick!==before)for(const o of state(this).objects)if(o.due!==null&&o.due<=this.tick){o.due=null;o.deathTick=null;if(!o.removed){o.hp=o.maxHP;o.dead=false;this.nav.dirty=true;evict(this,o);}}return out;};
  const restore=Simulation.restore;Simulation.restore=function(...args){const s=restore.apply(this,args);attach(s);if(state(s).objects.length&&!s.nav.dirty){const rev=s.nav.revision;s.nav.dirty=true;s.nav.rebuild(s.navigationBuildings(),s.gates);s.nav.revision=rev;delete s.nav.spawnPlacements;delete s.nav.spawnPlacementRevision;}return s;};
-CFTutorialSlices.register(Simulation.restore,function*(...args){const s=restore.apply(this,args);attach(s);if(state(s).objects.length&&!s.nav.dirty){const rev=s.nav.revision;s.nav.dirty=true;s.nav.rebuild(s.navigationBuildings(),s.gates);s.nav.revision=rev;delete s.nav.spawnPlacements;delete s.nav.spawnPlacementRevision;}return s;});
+CFTutorialSlices.register(Simulation.restore,function*(...args){const s=(yield* CFTutorialSlices.call(restore,this,args));attach(s);if(state(s).objects.length&&!s.nav.dirty){const rev=s.nav.revision;s.nav.dirty=true;(yield* CFTutorialSlices.rebuild(s.nav,s.navigationBuildings(),s.gates,s.nav.interactiveCells?.()||[]));s.nav.revision=rev;delete s.nav.spawnPlacements;delete s.nav.spawnPlacementRevision;}return s;});
 
 }
 const api={install};root.CFDestructibleRegrowth=api;if(typeof module==='object'&&module.exports)module.exports=api;
@@ -13830,7 +13864,7 @@ function draw(data,modes,envelope,builder,rng){
  const entry={builder:builder.id,side:builder.side,slots},receipt={version:1,entries:[...clone(envelope.entries),entry]};
  return {receipt,...replay(data,modes,receipt)};
 }
-function inverse(data){const d=clone(data);if(d.ultimateMode){
+function inverse(data){const d=(typeof module==='object'&&module.exports?require('./source-production-identity'):root.CFSourceProductionIdentity).cloneContent(data);if(d.ultimateMode){
  const hash=d.ultimateMode.priorRow?.contentHash;
  if(hash)for(const rows of [d.releaseV24.acceptedPriorHashes,d.release.legacySaves])rows.splice(rows.findIndex(r=>r.contentHash===hash),1);
  d.races=d.races.filter(r=>r.builder_id!=='h111');delete d.ultimateMode;}return d;}
@@ -13876,7 +13910,7 @@ function validateLive(q,legacy,d,row){
  const counts=new Map(),entered=v.entries.map(e=>{const b=actors.find(b=>b.id===e.builder&&b.side===e.side);if(!b)throw Error('Unauthorized Ultimate actor');counts.set(b.id,(counts.get(b.id)||0)+1);return b;});
  const result=replay(d,m,v,entered);
  for(const b of st.builders)if(counts.get(b.id)!==b.ultimateVisits||b.type==='h111'&&!counts.has(b.id))throw Error('Unauthorized Ultimate visit sequence');
- for(const ids of result.selected)for(const id of ids||[])if(!d.units[id])throw Error('Unknown Ultimate source type');
+ for(const ids of result.selected)for(const id of ids||[])if(id!=='null'&&!d.units[id])throw Error('Unknown Ultimate source type');
 }
 function install(Simulation,{registerAddon}={}){
  if(Object.hasOwn(Simulation,'__ultimate'))return;Simulation.__ultimate=true;
@@ -14102,7 +14136,7 @@ function validatePrior(q){
  if(rows.some(r=>r.module==='death-damage')&&(Object.hasOwn(q||{},'deathDamage')||Object.hasOwn(q?.state||{},'deathDamage')))throw Error('Invalid legacy death-damage save');
 }
 function inverse(data){
- let d=root.CFH06O?root.CFH06O.inverse(data):clone(data);
+ let d=root.CFH06O?root.CFH06O.inverse(data):(typeof module==='object'&&module.exports?require('./source-production-identity'):root.CFSourceProductionIdentity).cloneContent(data);
  // Peel final callback metadata before any typed afterCompose inverse.
  let restored=0;const metadata=d.releaseV24?.addonPreviousMetadata?.buildings||{};
  const index=Object.fromEntries(d.buildings.map(b=>[b.id,b]));
@@ -14243,8 +14277,8 @@ function withValidationData(d,fn){const old=validationData;validationData=d;try{
 function validationFood(id){return id==='h06Z'&&validationData?.h06z?validationData.h06z.food:id==='h06O'&&validationData?.h06o?validationData.h06o.food:null;}
 function validationDecaySource(e){return (!!validationData?.h06o&&e?.type==='h06O')||(!!validationData?.h06z&&e?.type==='h06Z');}
 function inverse(data){
- if(!data.h06o)return clone(data);
- const d=root.CFH06Z?root.CFH06Z.inverse(data):clone(data),p=d.h06o.previous;
+ if(!data.h06o)return (typeof module==='object'&&module.exports?require('./source-production-identity'):root.CFSourceProductionIdentity).cloneContent(data);
+ const d=root.CFH06Z?root.CFH06Z.inverse(data):(typeof module==='object'&&module.exports?require('./source-production-identity'):root.CFSourceProductionIdentity).cloneContent(data),p=d.h06o.previous;
  d.buildings=d.buildings.filter(b=>b.id!=='h06O');
  Object.assign(d.buildings.find(b=>b.id==='h01Q'),p.parent);
  d.abilities.A00A=p.ability;
@@ -14360,7 +14394,7 @@ CFH06O.install(CFV24.Simulation,CFV24);CFV24.importSave=(d,q)=>CFV24.Simulation.
 (function(root){'use strict';
 const clone=x=>JSON.parse(JSON.stringify(x));
 function inverse(data){
- const d=clone(data),c=d.h06z;if(!c)return d;const p=c.previous;
+ const d=(typeof module==='object'&&module.exports?require('./source-production-identity'):root.CFSourceProductionIdentity).cloneContent(data),c=d.h06z;if(!c)return d;const p=c.previous;
  d.buildings=d.buildings.filter(b=>b.id!=='h06Z');Object.assign(d.buildings.find(b=>b.id==='h06O'),p.parent);
  d.races.find(r=>r.race==='Undead').reachable_buildings=p.reachable;
  Object.assign(d.abilities,p.abilities);delete d.arsenal.limits.food.h06Z;
@@ -16080,17 +16114,24 @@ CFSettings.store=CFSettings.createStore();
   if(entry.url)URL.revokeObjectURL(entry.url);
   entry.url=null;externalBytes-=entry.reserved||0;entry.reserved=0;entry.status='idle';evictions++;return true;
  }
- function makeRoom(cost,keep=null){
+ function selectedPortrait(entry){return live(entry).some(image=>image.isConnected&&image.className==='assetPortrait');}
+ function makeRoom(cost,keep=null,priority=false){
   if(!Number.isSafeInteger(cost)||cost<0||cost>memoryBudget)return false;
   while(usage()+cost>memoryBudget){
-   const cold=[...entries.values()].filter(e=>e!==keep&&e.reserved&&e.status==='ready'&&e.used<frame-1&&!live(e).some(im=>im.isConnected)).sort((a,b)=>a.lastUse-b.lastUse)[0];
+   const cold=[...entries.values()].filter(e=>e!==keep&&e.reserved&&e.status==='ready'&&(priority?!selectedPortrait(e):e.used<frame-1&&!live(e).some(im=>im.isConnected))).sort((a,b)=>a.lastUse-b.lastUse)[0];
    if(!cold||!evict(cold))return false;
   }
   return true;
  }
  function reserve(entry){
   const cost=entry.owner==='art'?0:entry.spec.width*entry.spec.height*4;
-  if(!makeRoom(cost,entry))return false;
+  if(!makeRoom(cost,entry)){
+   if(!selectedPortrait(entry))return false;
+   // Atlas pixels belong to CFArt, not to this loader's external reservations.
+   // Reserve the selected portrait before another render can reclaim the room.
+   global.CFArt?.makeRoomForPortrait?.(cost);
+   if(!makeRoom(cost,entry,true))return false;
+  }
   entry.reserved=cost;externalBytes+=cost;peakBudgetBytes=Math.max(peakBudgetBytes,usage());return true;
  }
  async function verified(spec){
@@ -16253,7 +16294,7 @@ CFSettings.store=CFSettings.createStore();
  global.CFArtLoader={init,image,get ready(){return ready;},retry,memoryBudget,sha256,makeRoom:bytes=>makeRoom(bytes),
   receiveManifest(value){if(receiver?.kind==='manifest'&&typeof value==='string')receiver.accept(value);},
   receive(key,value){if(receiver?.kind==='media'&&receiver.key===key&&typeof value==='string')receiver.accept(value);},
-  bytes,
+  bytes,canEvict:image=>states.get(image)?.entry.status!=='loading',
   get hasFailures(){return !manifest||failed.size>0||failedAudio.size>0;},
   get externalBytes(){return externalBytes;},
   // Legacy diagnostic name only. Simulation storage must not depend on art.
@@ -17625,6 +17666,18 @@ CFPresentation.install(CastleFight.Simulation);
  const imageReady=image=>image?.getContext?image.width>0:!!(image?.complete&&image.naturalWidth);
  function cached(key){const item=cache.get(key);if(!item)return null;item.epoch=epoch;cache.delete(key);cache.set(key,item);return item.image;}
  function evict(key,release=true){const item=cache.get(key);if(!item)return;cache.delete(key);decodedBytes-=item.bytes;if(release)item.image.src='';}
+ // The selected inspector portrait outranks cached battlefield art, including
+ // recent frames. Never cancel an active decode; maintenance retries afterward.
+ function makeRoomForPortrait(bytes){
+  if(!Number.isSafeInteger(bytes)||bytes<0||bytes>memoryBudget)return false;
+  while(decodedBytes+bytes+(window.CFArtLoader?.externalBytes||0)>memoryBudget){
+   const cold=[...cache].filter(([,item])=>window.CFArtLoader?.canEvict(item.image)!==false)
+    .sort((a,b)=>a[1].epoch-b[1].epoch)[0];
+   if(!cold)return false;
+   evict(cold[0]);
+  }
+  return true;
+ }
  function layerImage(key,src,width,height){
   if(!src)return null;key='layer:'+key;
   if(cache.has(key)){const item=cache.get(key);item.epoch=epoch;cache.delete(key);cache.set(key,item);return item.image;}
@@ -17881,7 +17934,7 @@ CFPresentation.install(CastleFight.Simulation);
   ctx.restore();
  }
  const isHidden=e=>!!(bank.visibility?.[e.type]?.hidden||bank.visibility?.[visualType(e,null)]?.hidden);
- window.CFArt={draw,drawTransient,displayScale,displayWidth,flightOffset,hitRadius,drawTeamCircle,sprite,frame,ready,layerImage,isHidden,actionDuration:duration,
+ window.CFArt={makeRoomForPortrait,draw,drawTransient,displayScale,displayWidth,flightOffset,hitRadius,drawTeamCircle,sprite,frame,ready,layerImage,isHidden,actionDuration:duration,
   advancePresentation:(now,options={})=>presentation.advance(sim,now,{...options,paused:sim.paused,motion,duration:terminalDuration()}),
   terminalReady:()=>presentation.ready(sim,motion),get presentationTick(){return visualTick();},
   version:bank.version,get motionEnabled(){return motion;},get decodedCount(){return cache.size;},get decodedBytes(){return decodedBytes;},memoryBudget,get corpseCount(){return corpses.size;},get corpseEntities(){return [...corpses.values()];}};
@@ -19204,13 +19257,12 @@ window.CFWeeperBootstrap.uiInstalled=true;
 /* Prefer a worker; unavailable hosts use the same cooperatively traversed
  * validator on the page. Transport state is private, never a save field. */
 (function(root){'use strict';
-function create({content,Simulation,rebind,preferPage=false}){
- let worker,ready,sequence=0,pending,active=false;
+function create({content,Simulation,rebind,rebindSteps,preferPage=false}){
+ let worker,ready,sourceBlob,sequence=0,pending,active=false;
  const handshakeMs=30000;
  const pause=()=>new Promise(r=>root.setTimeout(r,0));
- function initialize(onSlice){
-  if(ready)return ready;
-  ready=(async()=>{
+ async function workerSource(onSlice){
+   if(sourceBlob)return sourceBlob;
    const session=root.document.getElementById('tutorialSessionSource'),engine=session?.previousElementSibling,content=engine?.previousElementSibling,boot=root.document.getElementById('tutorialWorkerSource');
    const nodes=[content,engine,session,boot];
    if(nodes.some(n=>n?.tagName!=='SCRIPT'||n.hasAttribute('src')))throw Error('Missing local tutorial validation source');
@@ -19228,7 +19280,16 @@ function create({content,Simulation,rebind,preferPage=false}){
     }while(offset<source.length&&performance.now()-start<8);onSlice(performance.now()-start,'encode');}
     parts.push(new Blob(['\n']));
    }
-   await pause();start=performance.now();const url=URL.createObjectURL(new Blob(parts,{type:'text/javascript'}));
+   await pause();start=performance.now();sourceBlob=new Blob(parts,{type:'text/javascript'});onSlice(performance.now()-start,'source-blob');
+   return sourceBlob;
+ }
+ function initialize(onSlice){
+  if(ready)return ready;
+  ready=(async()=>{
+   // The immutable source Blob survives failed workers. URLs and workers remain
+   // attempt-local and are still revoked/terminated on every startup failure.
+   const blob=await workerSource(onSlice);
+   await pause();let start=performance.now();const url=URL.createObjectURL(blob);
    const initialized=new Promise((resolve,reject)=>{
     let settled=false,timer;
     const finish=error=>{if(settled)return;settled=true;root.clearTimeout(timer);URL.revokeObjectURL(url);error?reject(error):resolve();};
@@ -19269,7 +19330,19 @@ function create({content,Simulation,rebind,preferPage=false}){
   // Fresh construction binds immutable content/profiles; mutable own fields and
   // registry domains come from the already-validated runtime, never raw input.
   await pause();start=performance.now();const s=new Simulation(content,result.envelope.snapshot.state.options);onSlice(performance.now()-start,'construct');
-  await pause();start=performance.now();Object.assign(s,result.fields);Object.assign(s.nav,result.navigation);rebind(s,result.envelope.snapshot);onSlice(performance.now()-start,'hydrate');
+  await pause();start=performance.now();Object.assign(s,result.fields);Object.assign(s.nav,result.navigation);onSlice(performance.now()-start,'hydrate-fields');
+  if(rebindSteps){
+   const steps=rebindSteps(s,result.envelope.snapshot);let next;
+   do{
+    await pause();start=performance.now();
+    try{do{next=steps.next();}while(!next.done&&performance.now()-start<8);}
+    finally{onSlice(performance.now()-start,'hydrate');}
+   }while(!next.done);
+  }else{
+   // Retain the synchronous API for existing callers. The official UI passes
+   // the cooperative hook explicitly, preserving every original hydrator.
+   await pause();start=performance.now();try{rebind(s,result.envelope.snapshot);}finally{onSlice(performance.now()-start,'hydrate');}
+  }
   await pause();start=performance.now();const lesson=new root.CFTutorial.Session(s,result.envelope.completed);onSlice(performance.now()-start,'session');
   return lesson;
   }finally{active=false;}
@@ -19278,7 +19351,7 @@ function create({content,Simulation,rebind,preferPage=false}){
 root.CFTutorialLoader=Object.freeze({create});
 })(globalThis);
 
-CFTutorial.install({restoreTutorial:CFTutorialLoader.create({content:CONTENT,Simulation:CastleFight.Simulation,rebind:CFV24.adoptValidatedTransfer,preferPage:true}),content:CONTENT,Simulation:CastleFight.Simulation,getSim:()=>sim,step:s=>CFV24.stepForUI(s),send,screen,fit,setRate:value=>window.CFSettingsUI?CFSettingsUI.temporaryRate(value):setRate(value),toast,openSetup,suppressEnd:()=>{endShown=true;},
+CFTutorial.install({restoreTutorial:CFTutorialLoader.create({content:CONTENT,Simulation:CastleFight.Simulation,rebind:CFV24.adoptValidatedTransfer,rebindSteps:CFV24.adoptValidatedTransferSteps,preferPage:true}),content:CONTENT,Simulation:CastleFight.Simulation,getSim:()=>sim,step:s=>CFV24.stepForUI(s),send,screen,fit,setRate:value=>window.CFSettingsUI?CFSettingsUI.temporaryRate(value):setRate(value),toast,openSetup,suppressEnd:()=>{endShown=true;},
  restoreSaveState:q=>{browserSaveEligible=q.browserSaveEligible;browserSaveHold=q.browserSaveHold;},
  capture:()=>({sim,rate,camera:{...camera},selected,selectedEntity,rescueMode,endShown,browserSaveEligible,browserSaveHold}),
  restore:q=>{sim=q.sim;window.CFSettingsUI?CFSettingsUI.restoreRate():setRate(q.rate);camera=q.camera;selected=q.selected;selectedEntity=q.selectedEntity;rescueMode=q.rescueMode;endShown=q.endShown;browserSaveEligible=q.browserSaveEligible;browserSaveHold=q.browserSaveHold;resetGestures();modalPause=null;accum=0;last=performance.now();document.body.classList.remove('showInspect');redrawCards();inspect();hint();updateHUD();},
@@ -19304,7 +19377,13 @@ root.onmessage=async({data:{id,input}})=>{
   const excluded=new Set(['data','B','U','A','R','nav']);
   const fields=Object.fromEntries(Object.keys(s).filter(k=>!excluded.has(k)&&!k.startsWith('_')).map(k=>[k,s[k]]));
   const navigation=Object.fromEntries(Object.entries(s.nav).filter(([key])=>key!=='data'));
-  root.postMessage({id,kind:'validated',envelope:lesson.snapshot(),fields,navigation});
+  // These grids were allocated by this restore's Navigation, never CONTENT.
+  // Transfer their backing stores after normalization, preserving typed views
+  // and aliases without cloning the large grids onto the page. The discarded
+  // worker lesson must not be used after postMessage detaches its buffers.
+  const envelope=lesson.snapshot();
+  const buffers=[navigation.flags,navigation.blocked,...navigation.flow].map(view=>view.buffer);
+  root.postMessage({id,kind:'validated',envelope,fields,navigation},[...new Set(buffers)]);
  }catch(e){root.postMessage({id,kind:'error',error:e.message});}
 };
 CFV24.admitData(CONTENT).then(()=>{ready=true;root.postMessage({kind:'ready'});},e=>root.postMessage({kind:'startup-error',error:e.message}));
