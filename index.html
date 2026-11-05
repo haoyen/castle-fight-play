@@ -9358,7 +9358,10 @@ function install(Simulation,{TPS=20,evidence}={}){
    if(chanceSucceeded){
     const d=dummy(this,v.side,v.x,v.y);
     const raw=this.A.A0D5,f=raw.fields,a={...raw,fields:{...f,targs1:f['targs'+level],Rng1:f['Rng'+level]}};
-    const target=this.autocastTarget(d,a,{pool:[source],visible:false});
+    // Damage credit can be a compact captured source (for example Parasite).
+    // Retaliation must target the current actor, never mutate that projection.
+    const actor=this.find(source.id);
+    const target=actor?.type===source.type?this.autocastTarget(d,a,{pool:[actor],visible:false}):null;
     if(target){
      const hp=target.hp,stun=target.stunUntil;
      this.damage(target,f['DataA'+level],'spells',d,{spell:true});damageDealt=Math.max(0,hp-target.hp);
